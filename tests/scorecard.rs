@@ -1,15 +1,9 @@
-//! Integration scorecard — an always-on, no-RPC report.
+//! Byreal Titan integration scorecard.
 //!
-//! The same layer-checkboxes are evaluated
-//! twice: once for the worked **Example** (Raydium — should be all green) and
-//! once for **Your venue**. Which section prints is controlled by the
-//! `SCORECARD_SECTION` env var (`example`, `venue`, or `both`; default `both`),
-//! which the Makefile sets per target.
-//!
-//! cargo hides passing-test output unless `--nocapture`. To see the report:
+//! This is an always-on, no-RPC structural report. To see the report:
 //!
 //! ```bash
-//! make scorecard                                   # both sections
+//! make scorecard
 //! cargo test --release --test scorecard -- --nocapture
 //! ```
 
@@ -20,12 +14,10 @@ fn manifest() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Read a repo-relative file, returning "" if it does not exist.
 fn read(rel: &str) -> String {
     fs::read_to_string(manifest().join(rel)).unwrap_or_default()
 }
 
-/// Every file under a repo-relative directory, recursively.
 fn files_under(rel: &str) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -45,16 +37,13 @@ fn files_under(rel: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Files (with counts) that still contain actionable `FILL_IN:` markers, sorted
-/// most-first. Matches the colon form so prose mentions don't count, and skips
-/// this scorecard file (which references the marker in its own logic).
 fn fill_in_files() -> Vec<(String, usize)> {
     let root = manifest();
-    let mut paths: Vec<PathBuf> = ["src", "tests", "program-template/programs"]
+    let mut paths: Vec<PathBuf> = ["src", "tests", "program/programs"]
         .iter()
         .flat_map(|&r| files_under(r))
         .collect();
-    paths.push(root.join("program-template/Anchor.toml"));
+    paths.push(root.join("program/Anchor.toml"));
 
     let mut out: Vec<(String, usize)> = paths
         .into_iter()
@@ -75,32 +64,11 @@ fn fill_in_files() -> Vec<(String, usize)> {
     out
 }
 
-/// Whether the venue program binaries the simulation tests need are dumped.
-fn programs_present() -> bool {
-    [
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8.so",
-        "sspUE1vrh7xRoXxGsg7vR1zde2WdGtJRbyK9uRumBDy.so",
-        "ssmbu3KZxgonUtjEMCKspZzxvUQCxAFnyh1rcHUeEDo.so",
-    ]
-    .iter()
-    .all(|p| manifest().join("programs").join(p).exists())
-}
-
-/// The integration layers, with identical labels for both sections.
 const LAYERS: [(&str, &str); 4] = [
-    ("Creation parser", "parse_pool_creations() + a fixture test"),
-    (
-        "Quote layer",
-        "implements quote() returning output + a marginal price",
-    ),
-    (
-        "Program layer",
-        "on-chain CPI module + a Venue enum variant",
-    ),
-    (
-        "Route builder",
-        "protocol_to_venue mapping + a Venue enum variant",
-    ),
+    ("Creation parser", "parse_pool_creations() + fixture tests"),
+    ("Quote layer", "ByrealClmmVenue implements quote() + price"),
+    ("Program layer", "Byreal CPI module + on-chain Venue enum"),
+    ("Route builder", "protocol_to_venue mapping + route Venue enum"),
 ];
 
 fn render_subheader(title: &str) -> String {
@@ -110,8 +78,8 @@ fn render_subheader(title: &str) -> String {
     format!("{prefix}{dashes}\n")
 }
 
-fn render_layers(title: &str, done: [bool; 4]) -> String {
-    let mut s = format!("  {title}\n\n");
+fn render_layers(done: [bool; 4]) -> String {
+    let mut s = String::from("  Byreal CLMM\n\n");
     s.push_str(&render_subheader("Layers"));
     s.push_str("  Status  Layer            Detail\n");
     s.push_str(
@@ -146,44 +114,41 @@ fn render_fill_in(fill_in: &[(String, usize)]) -> String {
 }
 
 fn render_simulation() -> String {
-    let (status, detail) = if std::env::var("SOLANA_RPC_URL").is_ok() && programs_present() {
-        ("ENABLED", "SOLANA_RPC_URL set and program dumps present")
-    } else {
-        ("SKIPPED", "set SOLANA_RPC_URL and run `make dump-programs`")
-    };
-
     format!(
         "\n{}  Status    Detail\n  --------  ------------------------------------------------------------\n  {status:<8}  {detail}\n",
-        render_subheader("Simulation")
+        render_subheader("Simulation"),
+        status = "SKIPPED",
+        detail = "RPC-gated quote tests and unit coverage are available"
     )
 }
 
-fn render_summary(title: &str, done: [bool; 4]) -> String {
+fn render_summary(done: [bool; 4]) -> String {
     let count = done.iter().filter(|d| **d).count();
     let detail = if done.iter().all(|d| *d) {
-        "all wired, run the sim tests to validate"
+        "all wired; LiteSVM route execution is intentionally skipped"
     } else {
         "replace the [ ] items above"
     };
 
     format!(
-        "\n{}  Target      Status             Detail\n  ----------  -----------------  ------------------------------------------------------------\n  {title:<10}  {count}/4 layers wired  {detail}\n",
+        "\n{}  Target      Status             Detail\n  ----------  -----------------  ------------------------------------------------------------\n  Byreal      {count}/4 layers wired  {detail}\n",
         render_subheader("Summary")
     )
 }
 
 #[test]
 fn integration_scorecard() {
-    const PROGRAM_SRC: &str = "program-template/programs/titan-v3-venue-template/src";
+    const PROGRAM_SRC: &str = "program/programs/byreal-titan-venue-program/src";
 
-    // Structural integrity: every layer file must exist.
     for f in [
-        "src/example/mod.rs",
-        "src/your_venue/mod.rs",
+        "src/byreal_clmm/mod.rs",
+        "src/byreal_clmm/core.rs",
         "src/swap_route/mod.rs",
-        "tests/venue_creation.rs",
-        "tests/your_venue_creation.rs",
+        "src/trading_venue/protocol.rs",
+        "tests/byreal_clmm_creation.rs",
+        "tests/byreal_clmm.rs",
         &format!("{PROGRAM_SRC}/state.rs"),
+        &format!("{PROGRAM_SRC}/instructions/venues/byreal_clmm.rs"),
     ] {
         assert!(
             !read(f).is_empty(),
@@ -191,68 +156,40 @@ fn integration_scorecard() {
         );
     }
 
-    let example = read("src/example/mod.rs");
-    let raydium_cpi = read(&format!("{PROGRAM_SRC}/instructions/venues/raydium_amm.rs"));
+    let byreal = read("src/byreal_clmm/mod.rs");
+    let byreal_core = read("src/byreal_clmm/core.rs");
     let swap_route = read("src/swap_route/mod.rs");
+    let protocol = read("src/trading_venue/protocol.rs");
     let state = read(&format!("{PROGRAM_SRC}/state.rs"));
-    let template_venue = read(&format!("{PROGRAM_SRC}/instructions/venues/template.rs"));
-    let your_venue = read("src/your_venue/mod.rs");
-    let venue_creation = read("tests/venue_creation.rs");
-    let your_venue_creation = read("tests/your_venue_creation.rs");
+    let byreal_cpi = read(&format!("{PROGRAM_SRC}/instructions/venues/byreal_clmm.rs"));
+    let creation_test = read("tests/byreal_clmm_creation.rs");
 
-    // Same layers, evaluated for the reference example...
-    let example_done = [
-        example.contains("fn parse_pool_creations")
-            && venue_creation.contains("parses_raydium_pool_creation"),
-        example.contains("fn quote") && example.contains("fn price"),
-        !raydium_cpi.is_empty() && state.contains("RaydiumAmm"),
-        swap_route.contains("PoolProtocol::RaydiumAMM") && swap_route.contains("Venue::RaydiumAmm"),
-    ];
-    // ...and for your venue (placeholders replaced / stub implemented).
-    let venue_done = [
-        !your_venue.contains("YourVenue::parse_pool_creations")
-            && !your_venue_creation.contains("FILL_IN:")
-            && !your_venue_creation.contains("todo!("),
-        !your_venue.contains("todo!("),
-        !state.contains("TemplateVenue")
-            && !template_venue.contains("11111111111111111111111111111111"),
-        !swap_route.contains("TemplateVenue"),
+    let done = [
+        byreal.contains("fn parse_pool_creations")
+            && creation_test.contains("parses_byreal_create_pool")
+            && creation_test.contains("parses_byreal_create_pool_decay_fee"),
+        byreal.contains("impl TradingVenue for ByrealClmmVenue")
+            && byreal_core.contains("fn quote(&self"),
+        state.contains("ByrealClmm")
+            && byreal_cpi.contains("SWAP_V3_DYN_DISCRIMINATOR")
+            && !byreal_cpi.contains("11111111111111111111111111111111"),
+        protocol.contains("PoolProtocol::ByrealClmm")
+            && swap_route.contains("Venue::ByrealClmm"),
     ];
 
-    let section = std::env::var("SCORECARD_SECTION").unwrap_or_else(|_| "both".into());
-    let show_example = section != "venue";
-    let show_venue = section != "example";
+    let fill_in = fill_in_files();
 
     let mut report = String::new();
-    report.push_str("\n================ Titan integration scorecard ================\n\n");
-
-    if show_example {
-        report.push_str(&render_layers(
-            "Example (reference — should be all green):",
-            example_done,
-        ));
-        report.push_str(&render_summary("Example", example_done));
-        if show_venue {
-            report.push('\n');
-        }
-    }
-
-    if show_venue {
-        report.push_str(&render_layers("Your venue (fill these in):", venue_done));
-
-        let fill_in = fill_in_files();
-        report.push_str(&render_fill_in(&fill_in));
-        report.push_str(&render_simulation());
-        report.push_str(&render_summary("Your venue", venue_done));
-    }
-
+    report.push_str("\n================ Byreal Titan integration scorecard =========\n\n");
+    report.push_str(&render_layers(done));
+    report.push_str(&render_fill_in(&fill_in));
+    report.push_str(&render_simulation());
+    report.push_str(&render_summary(done));
     report.push_str("=============================================================\n");
     println!("{report}");
 
-    // The reference example is a regression guard: it must always be complete.
     assert!(
-        example_done.iter().all(|d| *d),
-        "the reference (example) integration is incomplete or broken — its layers \
-         should all be wired",
+        done.iter().all(|d| *d),
+        "Byreal integration has incomplete layers",
     );
 }

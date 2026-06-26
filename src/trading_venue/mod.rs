@@ -1,13 +1,11 @@
 //! Core traits and data structures used by Titan-compatible trading venues.
 //!
-//! A "trading venue" is any automated market maker (AMM), orderbook, or
-//! proprietary liquidity engine that wishes to integrate with Titan’s quoting
-//! and routing framework.
+//! A "venue" is the AMM or liquidity program implementation that Titan can
+//! quote and route through.
 //!
 //! Implementers are responsible for correctly handling state updates,
 //! account deserialization, quoting semantics, and swap instruction
-//! generation. This template captures the information Titan needs to add
-//! support for a venue.
+//! generation.
 
 pub mod bounds;
 pub mod error;
@@ -146,7 +144,7 @@ pub trait AddressLookupTableTrait {
     ) -> Result<Vec<Pubkey>, TradingVenueError>;
 }
 
-/// Public template trait describing an AMM or trading venue for Titan integration.
+/// Public trait describing an AMM or trading venue for Titan integration.
 ///
 /// Any AMM, orderbook, or custom liquidity engine must implement this trait
 /// to be usable by Titan’s routing system.
@@ -212,7 +210,7 @@ pub trait TradingVenue {
             .ok_or(TradingVenueError::TokenInfoIndexError(i))
     }
 
-    /// Identify which protocol type this venue is (e.g. Raydium, Orca, Phoenix).
+    /// Identify which protocol type this venue is.
     fn protocol(&self) -> PoolProtocol;
 
     /// A human-readable label describing the venue’s protocol.
@@ -268,7 +266,7 @@ pub trait TradingVenue {
     ///    derivative of the output you quote, not an unrelated number.
     ///
     /// These invariants are checked directly by the pricing tests shipped with
-    /// this template (monotonicity and mean-value-theorem tests). A venue whose
+    /// this crate (monotonicity and mean-value-theorem tests). A venue whose
     /// `price` is inconsistent with its `expected_output` will fail them.
     fn quote(&self, request: QuoteRequest) -> Result<QuoteResult, TradingVenueError>;
 

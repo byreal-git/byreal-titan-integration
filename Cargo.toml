@@ -1,34 +1,38 @@
 [package]
-name = "titan-integration-template"
+name = "byreal-titan-integration"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anchor-lang = "0.31.1"
+anyhow = "1.0.99"
 arrayref = "0.3.6"
+bs58 = "0.4"
 bytemuck = { version = "1.22", features = ["derive"] }
 num_enum = "0.5.7"
 enumflags2 = "0.6.4"
 borsh = { version = "1.5.7", features = ["derive"] }
+byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm", rev = "650afbdf9d1b3bd6f6996eafd49254fde5f3e1c8", features = ["no-entrypoint"] }
 serde = "1.0.203"
 serde_json = "1.0.117"
 num-traits = "0.2"
 uint = "0.9.5"
 safe-transmute = "0.11.2"
-solana-client = "2.2.1"
-solana-rpc-client = "2.2.1"
-solana-pubkey = "2.2.1"
-solana-program = "2.2.1"
+solana-client = "2.3.0"
+solana-rpc-client = "2.3.0"
+solana-pubkey = "2.3.0"
+solana-program = "2.3.0"
 solana-program-pack = "2.2.1"
 solana-program-option = "2.2.1"
-solana-sysvar = "2.2.1"
+solana-sysvar = "2.3.0"
 solana-sdk-ids = "2.2.1"
 solana-account = "2.2.1"
-solana-account-info = "2.2.1"
-solana-instruction = "2.2.1"
+solana-account-info = "2.3.0"
+solana-instruction = "2.3.0"
 solana-compute-budget = "2.2.1"
 solana-transaction = "2.2.1"
-solana-hash = "2.2.1"
-solana-sdk = "2.2.1"
+solana-hash = "2.3.0"
+solana-sdk = "2.3.0"
 solana-instructions-sysvar = "2.2.1"
 bincode = "1.3.3"
 dashmap = "6.0.1"
@@ -37,14 +41,17 @@ rstest = "0.18"
 async-trait = "0.1.80"
 thiserror = "1.0.61"
 tokio = { version = "1.38.0", features = ["full"] }
-log = "0.4.28"
-env_logger = "0.11.3"
+pyth-solana-receiver-sdk = "=1.0.0"
 spl-token = { version = "7", features = ["no-entrypoint"] }
-spl-token-2022 = { version = "^9", features = ["no-entrypoint"]}
+spl-token-2022 = { version = "8.0.1", features = ["no-entrypoint"]}
+spl-memo = { version = "6", features = ["no-entrypoint"] }
 spl-associated-token-account = "6"
-litesvm =  { version = "^0.6.1"}
 rand = "0.9.2"
 assert_no_alloc = { version = "1.1.2", default-features = false }
+
+[dev-dependencies]
+env_logger = "0.11.3"
+log = "0.4.28"
 
 # Used only for the construction allocation check. Normal tests, including
 # `quoting_speed`, run under true `--release`.

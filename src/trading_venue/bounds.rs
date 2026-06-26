@@ -83,7 +83,6 @@ pub fn find_boundaries_coarse(
 
         // Overflow/saturation protection
         if lower_high <= lower_low || lower_high == u64::MAX {
-            log::error!("Invalid lower/upper combination or hit u64::MAX");
             lower_high = u64::MAX;
             break;
         }
@@ -106,7 +105,6 @@ pub fn find_boundaries_coarse(
             upper_high = upper_high.saturating_mul(SCALING_FACTOR);
 
             if upper_high <= upper_low || upper_high == u64::MAX {
-                log::trace!("Hit overflow during upper search");
                 upper_high = u64::MAX;
                 break;
             }
@@ -136,30 +134,6 @@ pub fn refine_lower(
     mut low: u64,
     mut high: u64,
 ) -> Result<u64, TradingVenueError> {
-    // These invariant checks should normally never trigger.
-    let low_quote = f(low);
-    let high_quote = f(high);
-
-    if let Ok(ref result) = low_quote
-        && valid_quote(result)
-    {
-        log::error!("The lower low quotes successfully; this contradicts the search invariant.");
-    }
-
-    match high_quote {
-        Ok(result) => {
-            if !valid_quote(&result) {
-                log::error!("The upper low is invalid; this contradicts the search invariant.");
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "The upper low errored; this contradicts the search invariant: {:?}",
-                e
-            );
-        }
-    }
-
     // Binary search
     while (high - low) > 100 {
         let mid = high / 2 + low / 2;
@@ -198,31 +172,6 @@ pub fn refine_upper(
     mut low: u64,
     mut high: u64,
 ) -> Result<u64, TradingVenueError> {
-    let low_quote = f(low);
-    let high_quote = f(high);
-
-    // Sanity checks ― not usually hit
-    match low_quote {
-        Ok(result) => {
-            if !valid_quote(&result) {
-                log::error!("The upper low is invalid; this contradicts invariants.");
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "The upper low errored; this contradicts invariants: {:?}",
-                e
-            );
-        }
-    }
-
-    if let Ok(ref result) = high_quote
-        && valid_quote(result)
-        && high != u64::MAX
-    {
-        log::error!("The upper high is valid; this contradicts the expected invalid boundary.");
-    }
-
     // Binary search
     while (high - low) > 100 {
         let mid = high / 2 + low / 2;

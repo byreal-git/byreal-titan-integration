@@ -1,8 +1,9 @@
 //! Off-chain helper for turning a quoter [`TradingVenue`] into route instruction
 //! inputs.
 //!
-//! The template mirrors the route-leg shape needed by the program template so
-//! you can build and test a route leg for your venue in this repository.
+//! This module mirrors the route-leg shape needed by the Byreal Titan program
+//! so the off-chain integration and on-chain dispatcher serialize identical
+//! route legs.
 //!
 //! ## How a leg fits into the route
 //!
@@ -21,9 +22,9 @@
 //!
 //! ## The two-`Venue`-enums contract
 //!
-//! [`Venue`] here must match the program template's `Venue` enum
-//! (`program-template/.../src/state.rs`) byte-for-byte: same variants, same
-//! order. The program template ships an enum-parity test that fails if they
+//! [`Venue`] here must match the program's `Venue` enum
+//! (`program/.../src/state.rs`) byte-for-byte: same variants, same
+//! order. The program ships an enum-parity test that fails if they
 //! drift.
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -44,31 +45,22 @@ pub const ROUTE_WEIGHT_ALL: u32 = 1_000_000_000;
 /// Route venue selector.
 ///
 /// **Must stay byte-for-byte identical (same variants, same order) to the
-/// `Venue` enum in the program template's `state.rs`.** A mismatch can dispatch
-/// to the wrong venue. The program template's enum-parity test guards this.
+/// `Venue` enum in the program's `state.rs`.** A mismatch can dispatch
+/// to the wrong venue. The program's enum-parity test guards this.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Venue {
-    RaydiumAmm,
-    // FILL_IN: add your venue variant here, in the SAME position as in
-    // `state.rs`. Include any CPI parameters the router must pass to your venue
-    // adapter, such as direction flags.
-    TemplateVenue { zero_for_one: bool },
-}
-
-#[allow(dead_code)]
-fn fill_in_route_venue_variant() -> ! {
-    todo!("add your route Venue variant in the same position as the program enum")
+    ByrealClmm { zero_for_one: bool },
 }
 
 impl Venue {
-    /// Borsh-serialized bytes for this variant. Used by the program template's
+    /// Borsh-serialized bytes for this variant. Used by the program's
     /// enum-parity test to cross-check both venue enums.
     pub fn to_borsh_bytes(&self) -> Vec<u8> {
         borsh::to_vec(self).expect("Venue serializes infallibly")
     }
 }
 
-/// One route leg. Matches the program template's `SwapSpecInputV2` so it
+/// One route leg. Matches the program's `SwapSpecInputV2` so it
 /// Borsh-serializes identically.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SwapSpecInputV2 {
@@ -87,7 +79,7 @@ pub struct SwapSpecInputV2 {
 
 /// Map a quoter [`TradingVenue`] and request to its on-chain [`Venue`] variant.
 ///
-/// This must agree with the program template's venue dispatch match. Store any
+/// This must agree with the program's venue dispatch match. Store any
 /// CPI-specific parameters the program needs, such as direction flags, in the
 /// returned `Venue` variant.
 pub fn protocol_to_venue(
@@ -95,11 +87,22 @@ pub fn protocol_to_venue(
     request: &QuoteRequest,
 ) -> Result<Venue, TradingVenueError> {
     match venue.protocol() {
-        PoolProtocol::RaydiumAMM => Ok(Venue::RaydiumAmm),
-        // FILL_IN: map your PoolProtocol variant to your Venue variant.
-        PoolProtocol::YourPoolProtocol => {
-            let _ = (venue, request);
-            todo!("map YourPoolProtocol to your Venue variant")
+        PoolProtocol::ByrealClmm => {
+            let tokens = venue.get_token_info();
+            let input_index = tokens
+                .iter()
+                .position(|token| token.pubkey == request.input_mint)
+                .ok_or_else(|| TradingVenueError::InvalidMint(request.input_mint.into()))?;
+            let output_index = tokens
+                .iter()
+                .position(|token| token.pubkey == request.output_mint)
+                .ok_or_else(|| TradingVenueError::InvalidMint(request.output_mint.into()))?;
+            if input_index == output_index || tokens.len() < 2 {
+                return Err(TradingVenueError::InvalidMint(request.input_mint.into()));
+            }
+            Ok(Venue::ByrealClmm {
+                zero_for_one: input_index == 0 && output_index == 1,
+            })
         }
     }
 }
@@ -126,6 +129,8 @@ pub fn build_swap_leg(
     to: u8,
     weight_nanos: u32,
 ) -> Result<(SwapSpecInputV2, Vec<AccountMeta>), TradingVenueError> {
+    fail_closed_for_transfer_fee_route_mints(venue, request)?;
+
     let swap_ix = venue.generate_swap_instruction(request.clone(), titan_pda)?;
     let accounts = assemble_leg_accounts(&swap_ix, titan_pda, venue.program_id());
 
@@ -138,6 +143,23 @@ pub fn build_swap_leg(
     };
 
     Ok((spec, accounts))
+}
+
+fn fail_closed_for_transfer_fee_route_mints(
+    venue: &dyn TradingVenue,
+    request: &QuoteRequest,
+) -> Result<(), TradingVenueError> {
+    for token in venue.get_token_info() {
+        if token.pubkey == request.input_mint || token.pubkey == request.output_mint {
+            if token.transfer_fee.is_some() {
+                return Err(TradingVenueError::UnsupportedVenue(
+                    "Token-2022 transfer-fee route mints require route-level gross/net accounting"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Turn a venue's raw swap instruction into the leg's remaining-accounts list:
@@ -171,7 +193,7 @@ fn assemble_leg_accounts(
 /// Encode the full `swap_route_v3` instruction data: the single-byte
 /// discriminator followed by the Borsh serialization of `(amount, mints, swaps)`.
 ///
-/// This is the wire format expected by the program template.
+/// This is the wire format expected by the program.
 pub fn encode_swap_route_v3_data(amount: u64, mints: u8, swaps: &[SwapSpecInputV2]) -> Vec<u8> {
     let mut data = vec![SWAP_ROUTE_V3_DISCRIMINATOR];
     data.extend_from_slice(&amount.to_le_bytes());
@@ -279,10 +301,24 @@ mod tests {
     #[test]
     fn protocol_maps_to_venue() {
         let request = request();
-        let raydium = mock_venue(PoolProtocol::RaydiumAMM, vec![]);
+        let byreal = mock_venue(
+            PoolProtocol::ByrealClmm,
+            vec![
+                TokenInfo {
+                    pubkey: request.input_mint,
+                    decimals: 9,
+                    ..Default::default()
+                },
+                TokenInfo {
+                    pubkey: request.output_mint,
+                    decimals: 6,
+                    ..Default::default()
+                },
+            ],
+        );
         assert_eq!(
-            protocol_to_venue(&raydium, &request).unwrap(),
-            Venue::RaydiumAmm
+            protocol_to_venue(&byreal, &request).unwrap(),
+            Venue::ByrealClmm { zero_for_one: true }
         );
     }
 
@@ -292,8 +328,19 @@ mod tests {
         let venue = MockVenue {
             titan_pda,
             other: Pubkey::new_from_array([8u8; 32]),
-            protocol: PoolProtocol::RaydiumAMM,
-            token_info: vec![],
+            protocol: PoolProtocol::ByrealClmm,
+            token_info: vec![
+                TokenInfo {
+                    pubkey: request().input_mint,
+                    decimals: 9,
+                    ..Default::default()
+                },
+                TokenInfo {
+                    pubkey: request().output_mint,
+                    decimals: 6,
+                    ..Default::default()
+                },
+            ],
         };
 
         let (spec, accounts) =
@@ -302,7 +349,7 @@ mod tests {
         // Two venue accounts + the appended program id.
         assert_eq!(accounts.len(), 3);
         assert_eq!(spec.n_accounts, 3);
-        assert_eq!(spec.venue, Venue::RaydiumAmm);
+        assert_eq!(spec.venue, Venue::ByrealClmm { zero_for_one: true });
         assert_eq!((spec.from, spec.to), (0, 1));
 
         // TitanPDA must no longer be marked a signer.
@@ -316,9 +363,38 @@ mod tests {
     }
 
     #[test]
+    fn build_swap_leg_rejects_transfer_fee_route_mints() {
+        let titan_pda = Pubkey::new_from_array([9u8; 32]);
+        let request = request();
+        let venue = MockVenue {
+            titan_pda,
+            other: Pubkey::new_from_array([8u8; 32]),
+            protocol: PoolProtocol::ByrealClmm,
+            token_info: vec![
+                TokenInfo {
+                    pubkey: request.input_mint,
+                    decimals: 9,
+                    transfer_fee: Some(25),
+                    maximum_fee: Some(10_000),
+                    ..Default::default()
+                },
+                TokenInfo {
+                    pubkey: request.output_mint,
+                    decimals: 6,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let err = build_swap_leg(&venue, &request, titan_pda, 0, 1, ROUTE_WEIGHT_ALL)
+            .expect_err("transfer-fee route mints must fail closed");
+        assert!(matches!(err, TradingVenueError::UnsupportedVenue(_)));
+    }
+
+    #[test]
     fn encodes_instruction_data_like_anchor() {
         let spec = SwapSpecInputV2 {
-            venue: Venue::RaydiumAmm,
+            venue: Venue::ByrealClmm { zero_for_one: true },
             from: 0,
             to: 1,
             weight_nanos: ROUTE_WEIGHT_ALL,
@@ -330,7 +406,8 @@ mod tests {
         expected.extend_from_slice(&5_000u64.to_le_bytes()); // amount
         expected.push(2); // mints
         expected.extend_from_slice(&1u32.to_le_bytes()); // swaps len
-        expected.push(0); // Venue::RaydiumAmm discriminant
+        expected.push(0); // Venue::ByrealClmm discriminant
+        expected.push(1); // zero_for_one
         expected.push(0); // from
         expected.push(1); // to
         expected.extend_from_slice(&ROUTE_WEIGHT_ALL.to_le_bytes());
@@ -340,17 +417,16 @@ mod tests {
 
     #[test]
     fn venue_borsh_bytes_are_stable() {
-        assert_eq!(Venue::RaydiumAmm.to_borsh_bytes(), vec![0]);
         assert_eq!(
-            Venue::TemplateVenue {
+            Venue::ByrealClmm {
                 zero_for_one: false,
             }
             .to_borsh_bytes(),
-            vec![1, 0]
+            vec![0, 0]
         );
         assert_eq!(
-            Venue::TemplateVenue { zero_for_one: true }.to_borsh_bytes(),
-            vec![1, 1]
+            Venue::ByrealClmm { zero_for_one: true }.to_borsh_bytes(),
+            vec![0, 1]
         );
     }
 }

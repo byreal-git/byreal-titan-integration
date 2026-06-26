@@ -1,10 +1,9 @@
 //! Venue-creation parsing contract.
 //!
 //! Titan tracks new pools live by watching confirmed transactions and detecting
-//! when a venue's program creates a new pool. Each integration provides a
-//! `parse_pool_creations` function (see the worked Raydium reference in
-//! [`crate::example`] and the stub in [`crate::your_venue`]) that maps the
-//! decompiled instructions of a transaction to the pools it created.
+//! when a venue's program creates a new pool. The Byreal integration provides a
+//! `parse_pool_creations` function that maps the decompiled instructions of a
+//! transaction to the pools it created.
 //!
 //! The parser works purely off instruction data, so it stays free of any RPC
 //! transaction-encoding types: the caller decompiles a confirmed transaction

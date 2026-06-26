@@ -117,21 +117,14 @@ impl AccountsCache for RpcClientCache {
     ) -> Result<Vec<Option<Account>>, AccountCacheError> {
         let mut keys = Vec::new();
         let mut result_map: AHashMap<Pubkey, Option<Account>> = AHashMap::default();
-        let cached_results = self.get_multiple(pubkeys);
 
-        // Identify cache hits and misses
-        cached_results
-            .iter()
-            .zip(pubkeys.iter())
-            .for_each(|(account, pubkey)| {
-                if let Some(res) = account {
-                    // Cached hit
-                    result_map.insert(*pubkey, Some(res.clone()));
-                } else {
-                    // Needs RPC fetch
-                    keys.push(*pubkey);
-                }
-            });
+        for pubkey in pubkeys {
+            if let Some(account) = self.cache.get(pubkey) {
+                result_map.insert(*pubkey, account.clone());
+            } else {
+                keys.push(*pubkey);
+            }
+        }
 
         // Batch RPC call for missing keys
         if !keys.is_empty() {
