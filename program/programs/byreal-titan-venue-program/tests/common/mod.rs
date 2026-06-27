@@ -34,6 +34,8 @@ use solana_transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+const SAMPLE_COUNT: usize = 10;
+
 pub trait RouteVenue: TradingVenue + FromAccount + Send + Sync {}
 impl<T: TradingVenue + FromAccount + Send + Sync> RouteVenue for T {}
 
@@ -151,12 +153,30 @@ fn create_token_account(token: &TokenInfo, owner: Pubkey, amount: u64) -> Accoun
     account
 }
 
-fn token_amount(litesvm: &LiteSVM, token_account: Pubkey) -> u64 {
-    let account = litesvm
-        .get_account(&token_account)
-        .expect("token account missing after route");
-    TokenAccount::unpack(account.data())
-        .expect("token account must unpack")
+fn simulated_output_amount(
+    litesvm: &mut LiteSVM,
+    payer: &Keypair,
+    output_ata: Pubkey,
+    ix: Instruction,
+    context: &str,
+) -> u64 {
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        litesvm.latest_blockhash(),
+    );
+    let simulation_result = litesvm
+        .simulate_transaction(tx)
+        .unwrap_or_else(|err| panic!("{context}: route simulation failed: {err:?}"));
+    let output_account = simulation_result
+        .post_accounts
+        .into_iter()
+        .find(|(pubkey, _)| pubkey == &output_ata)
+        .map(|(_, account)| account)
+        .expect("output token account missing from simulation");
+    TokenAccount::unpack_from_slice(output_account.data())
+        .expect("failed to unpack output token account")
         .amount
 }
 
@@ -245,6 +265,18 @@ fn build_route_instruction(
         accounts,
         data: encode_swap_route_v3_data(request.amount, 2, &[spec]),
     })
+}
+
+fn sample_amounts(lower: u64, upper: u64) -> Vec<u64> {
+    let low = lower.max(1);
+    let high = upper.max(low);
+    (0..SAMPLE_COUNT)
+        .map(|i| {
+            let numerator = (high - low) as u128 * i as u128;
+            let offset = numerator / (SAMPLE_COUNT - 1) as u128;
+            low.saturating_add(offset as u64)
+        })
+        .collect()
 }
 
 async fn build_venue<V: RouteVenue>(rpc_url: String, pool: Pubkey) -> (V, RpcClientCache) {
@@ -401,54 +433,56 @@ pub async fn run_swap_route<V: RouteVenue>() {
         let (lower, upper) = venue
             .bounds(input_index, output_index)
             .expect("failed to compute bounds");
-        let amount = lower.max(1).min(upper);
-        let request = exact_in(input_mint, output_mint, amount);
-        let quote = venue.quote(request.clone()).expect("quote failed");
-        if quote.not_enough_liquidity || quote.expected_output == 0 {
-            continue;
+        for amount in sample_amounts(lower, upper) {
+            let request = exact_in(input_mint, output_mint, amount);
+            let quote = venue.quote(request.clone()).expect("quote failed");
+            if quote.not_enough_liquidity || quote.expected_output == 0 {
+                continue;
+            }
+
+            let route_ix =
+                match build_route_instruction(payer.pubkey(), titan_pda, &venue, &request) {
+                    Ok(ix) => ix,
+                    Err(TradingVenueError::UnsupportedVenue(reason)) => {
+                        eprintln!(
+                            "SKIP {}: route unsupported for {} -> {}: {reason}",
+                            current_test(),
+                            input_mint,
+                            output_mint,
+                        );
+                        continue;
+                    }
+                    Err(err) => panic!("failed to build route instruction: {err:?}"),
+                };
+            load_route_accounts(
+                &mut litesvm,
+                &cache,
+                &venue,
+                payer.pubkey(),
+                titan_pda,
+                &request,
+                &route_ix,
+            )
+            .await;
+
+            let output_token = token_for_mint(&venue, request.output_mint);
+            let output_ata = get_associated_token_address_with_program_id(
+                &payer.pubkey(),
+                &request.output_mint,
+                &output_token.get_token_program(),
+            );
+            let context = format!("{input_mint} -> {output_mint} amount={amount}");
+            let simulated =
+                simulated_output_amount(&mut litesvm, &payer, output_ata, route_ix, &context);
+            println!(
+                "[{input_mint} -> {output_mint}] amount={amount} quote={} sim={simulated}",
+                quote.expected_output
+            );
+
+            assert_eq!(
+                simulated, quote.expected_output,
+                "route simulation output mismatch for {input_mint} -> {output_mint} amount {amount}",
+            );
         }
-
-        let route_ix =
-            match build_route_instruction(payer.pubkey(), titan_pda, &venue, &request) {
-                Ok(ix) => ix,
-                Err(TradingVenueError::UnsupportedVenue(reason)) => {
-                    eprintln!(
-                        "SKIP {}: route unsupported for {} -> {}: {reason}",
-                        current_test(),
-                        input_mint,
-                        output_mint,
-                    );
-                    continue;
-                }
-                Err(err) => panic!("failed to build route instruction: {err:?}"),
-            };
-        load_route_accounts(
-            &mut litesvm,
-            &cache,
-            &venue,
-            payer.pubkey(),
-            titan_pda,
-            &request,
-            &route_ix,
-        )
-        .await;
-
-        let output_token = token_for_mint(&venue, request.output_mint);
-        let output_ata = get_associated_token_address_with_program_id(
-            &payer.pubkey(),
-            &request.output_mint,
-            &output_token.get_token_program(),
-        );
-        let before = token_amount(&litesvm, output_ata);
-        send(&mut litesvm, &payer, route_ix);
-        let after = token_amount(&litesvm, output_ata);
-        let simulated = after
-            .checked_sub(before)
-            .expect("output account balance decreased");
-
-        assert_eq!(
-            simulated, quote.expected_output,
-            "route simulation output mismatch for {input_mint} -> {output_mint} amount {amount}",
-        );
     }
 }
