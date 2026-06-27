@@ -72,11 +72,14 @@ the off-chain account list.
 
 ## Tests
 
-Route execution is a compile-time smoke test right now. LiteSVM execution is not
-wired for this integration because the simulator dependency tree conflicts with
-the Solana 2.3/Byreal CLMM dependency line.
+Route execution is covered by a LiteSVM test that is isolated to this program
+test crate. The SDK crate has no LiteSVM dependency. The test skips unless
+`SOLANA_RPC_URL`, `BYREAL_CLMM_POOL`, a built route program, and a dumped
+production Byreal CLMM program are all available.
 
 ```bash
+make build-program
+make dump-programs
 cargo test --manifest-path program/Cargo.toml --release --lib --test venue_parity
 cargo test --manifest-path program/Cargo.toml --release --lib byreal_clmm
 cargo test --manifest-path program/Cargo.toml --release --test byreal_clmm_route -- --nocapture

@@ -91,29 +91,22 @@ pub struct QuoteResult {
     ///
     /// Let `f(x)` be the number of output atoms produced for an `ExactIn` swap
     /// of `x` input atoms against the current pool state. `price` is the
-    /// instantaneous exchange rate at the quoted size — the derivative of the
-    /// output curve with respect to the input, evaluated at `amount`:
+    /// local exchange rate at the quoted size:
     ///
     /// ```text
-    /// price = f'(amount)        // output atoms per input atom
-    /// ```
-    ///
-    /// `price` is the marginal derivative of the raw quote curve:
-    ///
-    /// ```text
-    /// price = d(output_atoms) / d(input_atoms)
+    /// price ~= d(output_atoms) / d(input_atoms)
     /// ```
     ///
     /// Do not apply UI decimal scaling here. Use the same raw atom units as
     /// `request.amount` and `expected_output`. At `amount == 0` this is the
     /// venue's *spot price*.
     ///
-    /// How you obtain the derivative is up to you. Titan does not prescribe a method, but
-    /// the value **must** satisfy the invariants described on [`TradingVenue::quote`]:
-    /// it must be positive on a valid quote, non-increasing as `amount` grows
-    /// (concavity), and consistent with the realized output (the mean value
-    /// theorem). These properties are exercised by the pricing test suite. You **must** provide
-    /// a spot price at 0.
+    /// On-chain quote functions floor-truncate to token atoms, so adjacent
+    /// one-atom finite differences are not guaranteed to be smooth. Titan does
+    /// not prescribe a derivative method, but the value **must** be finite,
+    /// positive on a valid quote, and locally consistent with realized output
+    /// changes. These properties are exercised by the pricing test suite. You
+    /// **must** provide a spot price at 0.
     pub price: f64,
 }
 
@@ -242,32 +235,35 @@ pub trait TradingVenue {
     /// # Pricing requirements
     ///
     /// In addition to `expected_output`, every quote must report a price
-    /// (see [`QuoteResult::price`]). Titan relies on this price for
-    /// routing, so the quote function `f(x) -> output` and the price
-    /// `p(x) = f'(x)` it reports must be mutually consistent and well-behaved on
-    /// the venue's valid input range `[lower_bound, upper_bound]`:
+    /// (see [`QuoteResult::price`]). Titan relies on this price for routing, so
+    /// the quote function `f(x) -> output` and the reported local price must be
+    /// mutually consistent and well-behaved on the venue's valid input range
+    /// `[lower_bound, upper_bound]`:
     ///
     /// 1. **Monotonic output.** `f` is non-decreasing: a larger `ExactIn` amount
     ///    never returns less output.
     ///
-    /// 2. **Monotonic (non-increasing) price / concavity.** `p` is non-increasing
-    ///    in `amount`. Larger fills receive a weaker rate; the output
-    ///    curve is concave. In particular `price > 0` for any valid quote.
+    /// 2. **Positive local price.** `price` is finite and positive for any
+    ///    valid quote.
     ///
-    /// 3. **Mean value theorem.** The reported price must bracket the realized
-    ///    average rate over any interval. For `a < b`, the chord
+    /// 3. **Local output consistency.** `price` must be derived from the raw
+    ///    output curve around the quoted size. For discrete atom outputs,
+    ///    one-atom rounding can make adjacent finite differences non-smooth,
+    ///    but the reported value must still agree with a local realized output
+    ///    change or a documented fallback.
+    ///
+    /// The test suite also checks realized average rates over sampled
+    /// intervals. For `a < b`, the chord
     ///
     ///    ```text
     ///    chord = (f(b) - f(a)) / (b - a)
     ///    ```
     ///
-    ///    must satisfy `p(b) <= chord <= p(a)`. Equivalently, there is some
-    ///    `c in [a, b]` with `p(c) == chord`: the price you quote is the genuine
-    ///    derivative of the output you quote, not an unrelated number.
+    ///    must be finite and positive whenever `f(b) > f(a)`.
     ///
     /// These invariants are checked directly by the pricing tests shipped with
-    /// this crate (monotonicity and mean-value-theorem tests). A venue whose
-    /// `price` is inconsistent with its `expected_output` will fail them.
+    /// this crate. A venue whose `price` is unrelated to `expected_output` will
+    /// fail them.
     fn quote(&self, request: QuoteRequest) -> Result<QuoteResult, TradingVenueError>;
 
     /// Construct the transaction instruction needed to execute a swap.

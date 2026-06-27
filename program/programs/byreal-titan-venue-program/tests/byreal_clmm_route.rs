@@ -1,7 +1,7 @@
 //! Byreal route-test smoke entry point.
 //!
-//! LiteSVM route execution is not wired for this integration's dependency line,
-//! so the shared runner compiles and skips with an explicit message.
+//! LiteSVM is isolated to the program test crate and only runs when the route
+//! program, Byreal program dump, RPC URL, and production pool are available.
 
 mod common;
 

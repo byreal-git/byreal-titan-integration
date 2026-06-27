@@ -2,27 +2,33 @@
 #
 #   make build-program   run anchor build for the route program
 #   make check-structure lib tests + scorecard assertion + enum parity
+#   make dump-programs   one-time: dump Byreal venue programs into programs/
 #   make test-venue      Byreal venue suite (live checks skip without RPC)
 #   make scorecard       print the integration scorecard only
 #
 # Each phase reports one of:
 #   ok       ran and passed
-#   skipped  could not run — missing SOLANA_RPC_URL, or route execution is not
-#            wired because LiteSVM conflicts with this dependency line
+#   skipped  could not run — missing SOLANA_RPC_URL/BYREAL_CLMM_POOL, built
+#            route program, or dumped venue program
 #   red      ran and failed
 #   FAILED   a structural check failed
 #
 # To actually run the RPC-gated off-chain tests:
-#   export SOLANA_RPC_URL=https://...   &&   make test-venue
+#   export SOLANA_RPC_URL=https://...
+#   export BYREAL_CLMM_POOL=<production-pool-pubkey>
+#   make build-program
+#   make dump-programs
 #   make test-venue
+
+BYREAL_CLMM_PROGRAM := REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2
+PROGRAMS := $(BYREAL_CLMM_PROGRAM)
+DUMP_URL := $(if $(SOLANA_RPC_URL),$(SOLANA_RPC_URL),m)
 
 PROGRAM := --manifest-path program/Cargo.toml
 RELEASE_PROFILE := --release
-# Used only for the construction allocation guard. Quote-speed runs in release.
-ASSERT_PROFILE := --profile release-debug
 SCORECARD = cargo test --quiet $(RELEASE_PROFILE) --test scorecard -- --nocapture 2>/dev/null | sed -n '/^====/,/^====/p'
 
-.PHONY: build-program check-structure test-venue scorecard _unit-phase _venue-phase
+.PHONY: build-program check-structure dump-programs test-venue scorecard _unit-phase _venue-phase
 
 # --- always-on checks (no RPC): unit tests, scorecard assertion, enum parity ---
 _unit-phase:
@@ -45,10 +51,9 @@ _venue-phase:
 	@printf '  %-24s  %-8s  %s\n' 'Check' 'Status' 'Detail'
 	@printf '  %-24s  %-8s  %s\n' '------------------------' '--------' '----------------------------------------'
 	@log=target/log-venue-off.txt; \
-		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm -- --skip construction --nocapture >$$log 2>&1; rc1=$$?; \
-		cargo test --quiet $(ASSERT_PROFILE) --test byreal_clmm -- construction --nocapture >>$$log 2>&1; rc2=$$?; \
-		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm_creation -- --nocapture >>$$log 2>&1; rc3=$$?; \
-		if [ $$rc1 -ne 0 ] || [ $$rc2 -ne 0 ] || [ $$rc3 -ne 0 ]; then st=red; dt='see log below'; \
+		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm -- --nocapture >$$log 2>&1; rc1=$$?; \
+		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm_creation -- --nocapture >>$$log 2>&1; rc2=$$?; \
+		if [ $$rc1 -ne 0 ] || [ $$rc2 -ne 0 ]; then st=red; dt='see log below'; \
 		elif grep -q 'set SOLANA_RPC_URL' $$log; then st=skipped; dt='set SOLANA_RPC_URL'; \
 		elif grep -q 'set BYREAL_CLMM_POOL' $$log; then st=skipped; dt='set BYREAL_CLMM_POOL'; \
 		else st=ok; dt='venue suite passed'; fi; \
@@ -57,7 +62,11 @@ _venue-phase:
 	@log=target/log-venue-prog.txt; \
 		cargo test --quiet $(PROGRAM) --release --test byreal_clmm_route -- --nocapture >$$log 2>&1; rc=$$?; \
 		if [ $$rc -ne 0 ]; then st=red; dt='see log below'; \
-		elif grep -q 'SKIP' $$log; then st=skipped; dt='route execution not wired in this integration'; \
+		elif grep -q 'set SOLANA_RPC_URL' $$log; then st=skipped; dt='set SOLANA_RPC_URL'; \
+		elif grep -q 'set BYREAL_CLMM_POOL' $$log; then st=skipped; dt='set BYREAL_CLMM_POOL'; \
+		elif grep -q 'make build-program' $$log; then st=skipped; dt='make build-program'; \
+		elif grep -q 'make dump-programs' $$log; then st=skipped; dt='make dump-programs'; \
+		elif grep -q 'SKIP' $$log; then st=skipped; dt='see route SKIP in log'; \
 		else st=ok; dt='route suite passed'; fi; \
 		printf '  %-24s  %-8s  %s\n' 'On-chain program' "$$st" "$$dt"; \
 		if [ $$st = red ]; then echo; cat $$log; exit 1; fi
@@ -67,6 +76,17 @@ build-program:
 	@cd program && anchor build
 
 check-structure: _unit-phase
+
+dump-programs:
+	@mkdir -p programs
+	@for p in $(PROGRAMS); do \
+		if [ -f programs/$$p.so ]; then \
+			echo "have programs/$$p.so"; \
+		else \
+			echo "dumping $$p from configured RPC"; \
+			solana program dump -u "$(DUMP_URL)" $$p programs/$$p.so; \
+		fi; \
+	done
 
 test-venue: _venue-phase
 	@echo

@@ -40,7 +40,7 @@ Instruction discriminators:
 - Dynamic-fee pools require valid Pyth receiver `PriceUpdateV2` accounts and fresh positive prices.
 - Route building fails closed when either route input or output mint has Token-2022 transfer fees, because route-level custody does not yet model gross/net settlement.
 - Per-leg `other_amount_threshold` is `0`; Titan's route-level slippage guard remains the protection.
-- LiteSVM route execution is intentionally not wired for this dependency line. Tests keep simulation entry points as explicit skips.
+- LiteSVM is isolated to the program test crate. The SDK crate does not import or depend on LiteSVM.
 
 ## Main Implementation
 
@@ -83,4 +83,14 @@ program, not the test contract:
 export SOLANA_RPC_URL=https://...
 export BYREAL_CLMM_POOL=<production-pool-pubkey>
 cargo test --quiet --release --test byreal_clmm -- --skip construction --nocapture
+```
+
+LiteSVM-backed route execution lives under
+`program/programs/byreal-titan-venue-program/tests`. It additionally requires a
+built route program and a dumped production Byreal CLMM program:
+
+```bash
+make build-program
+make dump-programs
+cargo test --quiet --manifest-path program/Cargo.toml --release --test byreal_clmm_route -- --nocapture
 ```

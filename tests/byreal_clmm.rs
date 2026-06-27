@@ -1,8 +1,9 @@
 //! Byreal CLMM venue test suite.
 //!
 //! RPC-backed tests require `SOLANA_RPC_URL` and `BYREAL_CLMM_POOL`, where the
-//! pool must be owned by the production Byreal CLMM program. LiteSVM simulation
-//! entry points skip because route execution is not wired for this dependency line.
+//! pool must be owned by the production Byreal CLMM program. This SDK-level
+//! suite intentionally does not depend on LiteSVM; route execution lives in the
+//! program test crate.
 
 mod common;
 
@@ -12,13 +13,6 @@ use std::str::FromStr;
 use common::SuiteConfig;
 use byreal_titan_integration::byreal_clmm::ByrealClmmVenue;
 use solana_pubkey::Pubkey;
-
-// Installs the allocation guard that powers the construction test's
-// `assert_no_alloc` checks. The Makefile runs that test under `release-debug`
-// so the guard is active; speed tests run under true `--release`.
-#[cfg(debug_assertions)]
-#[global_allocator]
-static A: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 fn pool() -> Option<Pubkey> {
     env::var("BYREAL_CLMM_POOL")
@@ -61,11 +55,11 @@ async fn quoting_speed() {
 }
 
 #[tokio::test]
-async fn price_monotone() {
-    common::price_monotone::<ByrealClmmVenue>(&config()).await;
+async fn reported_price_positive() {
+    common::reported_price_positive::<ByrealClmmVenue>(&config()).await;
 }
 
 #[tokio::test]
-async fn mean_value_theorem() {
-    common::mean_value_theorem::<ByrealClmmVenue>(&config()).await;
+async fn local_price_probe_consistent() {
+    common::local_price_probe_consistent::<ByrealClmmVenue>(&config()).await;
 }

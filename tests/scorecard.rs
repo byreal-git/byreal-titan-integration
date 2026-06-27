@@ -118,14 +118,14 @@ fn render_simulation() -> String {
         "\n{}  Status    Detail\n  --------  ------------------------------------------------------------\n  {status:<8}  {detail}\n",
         render_subheader("Simulation"),
         status = "SKIPPED",
-        detail = "RPC-gated quote tests and unit coverage are available"
+        detail = "SDK-level simulation is skipped; program route tests use isolated LiteSVM"
     )
 }
 
 fn render_summary(done: [bool; 4]) -> String {
     let count = done.iter().filter(|d| **d).count();
     let detail = if done.iter().all(|d| *d) {
-        "all wired; LiteSVM route execution is intentionally skipped"
+        "all wired; LiteSVM route execution is isolated to the program test crate"
     } else {
         "replace the [ ] items above"
     };
