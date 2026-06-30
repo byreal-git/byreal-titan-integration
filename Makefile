@@ -26,6 +26,8 @@ DUMP_URL := $(if $(SOLANA_RPC_URL),$(SOLANA_RPC_URL),m)
 
 PROGRAM := --manifest-path program/Cargo.toml
 RELEASE_PROFILE := --release
+# Used only for the construction allocation guard. Quote-speed runs in release.
+ASSERT_PROFILE := --profile release-debug
 SCORECARD = cargo test --quiet $(RELEASE_PROFILE) --test scorecard -- --nocapture 2>/dev/null | sed -n '/^====/,/^====/p'
 
 .PHONY: build-program check-structure dump-programs test-venue scorecard _unit-phase _venue-phase
@@ -51,9 +53,10 @@ _venue-phase:
 	@printf '  %-24s  %-8s  %s\n' 'Check' 'Status' 'Detail'
 	@printf '  %-24s  %-8s  %s\n' '------------------------' '--------' '----------------------------------------'
 	@log=target/log-venue-off.txt; \
-		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm -- --nocapture >$$log 2>&1; rc1=$$?; \
-		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm_creation -- --nocapture >>$$log 2>&1; rc2=$$?; \
-		if [ $$rc1 -ne 0 ] || [ $$rc2 -ne 0 ]; then st=red; dt='see log below'; \
+		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm -- --skip construction --nocapture >$$log 2>&1; rc1=$$?; \
+		cargo test --quiet $(ASSERT_PROFILE) --test byreal_clmm -- construction --nocapture >>$$log 2>&1; rc2=$$?; \
+		cargo test --quiet $(RELEASE_PROFILE) --test byreal_clmm_creation -- --nocapture >>$$log 2>&1; rc3=$$?; \
+		if [ $$rc1 -ne 0 ] || [ $$rc2 -ne 0 ] || [ $$rc3 -ne 0 ]; then st=red; dt='see log below'; \
 		elif grep -q 'set SOLANA_RPC_URL' $$log; then st=skipped; dt='set SOLANA_RPC_URL'; \
 		elif grep -q 'set BYREAL_CLMM_POOL' $$log; then st=skipped; dt='set BYREAL_CLMM_POOL'; \
 		else st=ok; dt='venue suite passed'; fi; \

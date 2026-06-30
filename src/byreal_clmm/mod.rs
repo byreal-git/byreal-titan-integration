@@ -14,6 +14,7 @@ use solana_sysvar::clock::{self, Clock};
 use crate::{
     account_caching::AccountsCache,
     trading_venue::{
+        bounds::find_boundaries,
         FromAccount, QuoteRequest, QuoteResult, SwapType, TradingVenue,
         error::{ErrorInfo, TradingVenueError},
         protocol::PoolProtocol,
@@ -81,6 +82,7 @@ pub struct ByrealClmmVenue {
     token_info: Vec<TokenInfo>,
     initialized: bool,
     current_epoch: u64,
+    bounds_cache: [Option<(u64, u64)>; 2],
 }
 
 impl ByrealClmmVenue {
@@ -169,75 +171,43 @@ impl ByrealClmmVenue {
         Ok(())
     }
 
-    fn quote_output_for_price(&self, request: QuoteRequest) -> Result<u64, TradingVenueError> {
-        Self::ensure_exact_in(&request)?;
-        let quote = self.core.quote(request)?;
-        if quote.not_enough_liquidity {
-            return Err(TradingVenueError::NoQuotableValue(
-                "not enough liquidity for price probe".into(),
-            ));
+    fn refresh_bounds_cache(&mut self) -> Result<(), TradingVenueError> {
+        let mints = self.core.token_mints();
+        let mut bounds_cache = [None, None];
+
+        for (slot, input_index, output_index) in [(0, 0, 1), (1, 1, 0)] {
+            let input_mint = mints[input_index];
+            let output_mint = mints[output_index];
+            let quote_for_bounds = |amount: u64| {
+                let quote = self.core.quote(QuoteRequest {
+                    amount,
+                    swap_type: SwapType::ExactIn,
+                    input_mint,
+                    output_mint,
+                })?;
+                Ok(QuoteResult {
+                    input_mint,
+                    output_mint,
+                    amount: quote.in_amount,
+                    expected_output: quote.out_amount,
+                    not_enough_liquidity: quote.not_enough_liquidity,
+                    price: 0.0,
+                })
+            };
+            bounds_cache[slot] = Some(find_boundaries(&quote_for_bounds)?);
         }
-        Ok(quote.out_amount)
+
+        self.bounds_cache = bounds_cache;
+        Ok(())
     }
 
-    fn marginal_price(
-        &self,
-        request: QuoteRequest,
-        quoted_output: u64,
-    ) -> Result<f64, TradingVenueError> {
-        if request.amount == 0 {
-            let mut step = 1u64;
-            for _ in 0..32 {
-                let probe = QuoteRequest {
-                    amount: step,
-                    ..request.clone()
-                };
-                if let Ok(output) = self.quote_output_for_price(probe)
-                    && output > 0
-                {
-                    return Ok(output as f64 / step as f64);
-                }
-                step = step.saturating_mul(2);
-            }
-            return Err(TradingVenueError::NoQuotableValue(
-                "zero-input spot price probe produced no output".into(),
-            ));
+    fn bounds_cache_index_for_mints(&self, input_mint: Pubkey, output_mint: Pubkey) -> Option<usize> {
+        let mints = self.core.token_mints();
+        match (input_mint, output_mint) {
+            (input, output) if input == mints[0] && output == mints[1] => Some(0),
+            (input, output) if input == mints[1] && output == mints[0] => Some(1),
+            _ => None,
         }
-
-        let step = (request.amount / 10_000).max(1);
-        if let Some(next_amount) = request.amount.checked_add(step) {
-            let probe = QuoteRequest {
-                amount: next_amount,
-                ..request.clone()
-            };
-            if let Ok(next_output) = self.quote_output_for_price(probe)
-                && next_output > quoted_output
-            {
-                return Ok((next_output - quoted_output) as f64 / step as f64);
-            }
-        }
-
-        let previous_amount = request.amount.saturating_sub(step);
-        if previous_amount < request.amount {
-            let probe = QuoteRequest {
-                amount: previous_amount,
-                ..request.clone()
-            };
-            if let Ok(previous_output) = self.quote_output_for_price(probe)
-                && quoted_output > previous_output
-            {
-                return Ok((quoted_output - previous_output) as f64
-                    / (request.amount - previous_amount) as f64);
-            }
-        }
-
-        if quoted_output > 0 {
-            return Ok(quoted_output as f64 / request.amount as f64);
-        }
-
-        Err(TradingVenueError::NoQuotableValue(
-            "price probe produced no positive rate".into(),
-        ))
     }
 }
 
@@ -261,6 +231,7 @@ impl FromAccount for ByrealClmmVenue {
             token_info,
             initialized: false,
             current_epoch: 0,
+            bounds_cache: [None, None],
         })
     }
 }
@@ -319,6 +290,7 @@ impl TradingVenue for ByrealClmmVenue {
         let clock = Self::clock_from_account_map(&update_accounts)?;
         self.current_epoch = clock.epoch;
         self.refresh_token_info(&update_accounts, clock.epoch)?;
+        self.refresh_bounds_cache()?;
         self.initialized = true;
         Ok(())
     }
@@ -329,8 +301,17 @@ impl TradingVenue for ByrealClmmVenue {
         }
 
         Self::ensure_exact_in(&request)?;
-        let quote = self.core.quote(request.clone())?;
-        let price = self.marginal_price(request.clone(), quote.out_amount)?;
+        let upper_bound = self
+            .bounds_cache_index_for_mints(request.input_mint, request.output_mint)
+            .and_then(|index| self.bounds_cache[index].map(|(_, upper)| upper));
+        let quote = self
+            .core
+            .quote_with_price_upper_bound(request.clone(), upper_bound)?;
+        let price = if quote.not_enough_liquidity {
+            0.0
+        } else {
+            quote.price
+        };
 
         Ok(QuoteResult {
             input_mint: request.input_mint,
@@ -339,6 +320,26 @@ impl TradingVenue for ByrealClmmVenue {
             expected_output: quote.out_amount,
             not_enough_liquidity: quote.not_enough_liquidity,
             price,
+        })
+    }
+
+    fn bounds(&self, tkn_in_ind: u8, tkn_out_ind: u8) -> Result<(u64, u64), TradingVenueError> {
+        let cache_index = match (tkn_in_ind, tkn_out_ind) {
+            (0, 1) => 0,
+            (1, 0) => 1,
+            _ => {
+                self.get_token(tkn_in_ind as usize)?;
+                self.get_token(tkn_out_ind as usize)?;
+                return Err(TradingVenueError::BoundarySearchFailed(
+                    "Byreal CLMM supports only two-token directions".into(),
+                ));
+            }
+        };
+
+        self.bounds_cache[cache_index].ok_or_else(|| {
+            TradingVenueError::BoundarySearchFailed(
+                "bounds cache missing; call update_state()".into(),
+            )
         })
     }
 

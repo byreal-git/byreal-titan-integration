@@ -14,6 +14,8 @@ use std::time::Instant;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_pubkey::Pubkey;
 
+use assert_no_alloc::assert_no_alloc;
+
 use byreal_titan_integration::account_caching::rpc_cache::RpcClientCache;
 use byreal_titan_integration::trading_venue::{
     FromAccount, QuoteRequest, SwapType, TradingVenue,
@@ -125,72 +127,6 @@ fn exact_in(input_mint: Pubkey, output_mint: Pubkey, amount: u64) -> QuoteReques
     }
 }
 
-fn rates_close(left: f64, right: f64) -> bool {
-    const REL_TOL: f64 = 1e-9;
-    const ABS_TOL: f64 = 1e-12;
-    let scale = left.abs().max(right.abs()).max(1.0);
-    (left - right).abs() <= ABS_TOL + REL_TOL * scale
-}
-
-fn assert_price_locally_consistent<V: SuiteVenue>(
-    venue: &V,
-    request: QuoteRequest,
-    quoted_output: u64,
-    price: f64,
-) {
-    assert!(
-        price.is_finite() && price > 0.0,
-        "price must be positive, got {price} at {}",
-        request.amount
-    );
-
-    if request.amount == 0 {
-        return;
-    }
-
-    let step = (request.amount / 10_000).max(1);
-    let mut candidates = Vec::new();
-
-    if let Some(next_amount) = request.amount.checked_add(step) {
-        let probe = QuoteRequest {
-            amount: next_amount,
-            ..request.clone()
-        };
-        if let Ok(next_quote) = venue.quote(probe)
-            && next_quote.expected_output > quoted_output
-        {
-            candidates.push((next_quote.expected_output - quoted_output) as f64 / step as f64);
-        }
-    }
-
-    let previous_amount = request.amount.saturating_sub(step);
-    if previous_amount < request.amount {
-        let probe = QuoteRequest {
-            amount: previous_amount,
-            ..request.clone()
-        };
-        if let Ok(previous_quote) = venue.quote(probe)
-            && quoted_output > previous_quote.expected_output
-        {
-            candidates
-                .push((quoted_output - previous_quote.expected_output) as f64 / step as f64);
-        }
-    }
-
-    if candidates.is_empty() && quoted_output > 0 {
-        candidates.push(quoted_output as f64 / request.amount as f64);
-    }
-
-    assert!(
-        candidates
-            .iter()
-            .any(|candidate| rates_close(price, *candidate)),
-        "price {price} is not locally consistent at {}; candidate rates: {:?}",
-        request.amount,
-        candidates
-    );
-}
-
 /// Fetch the pool, build the venue, and bring it to a fully-updated state.
 /// Returns the venue plus the RPC cache it was loaded through (reused for sims).
 async fn build_venue<V: SuiteVenue>(rpc_url: String, pool: Pubkey) -> (V, RpcClientCache) {
@@ -215,7 +151,7 @@ async fn build_venue<V: SuiteVenue>(rpc_url: String, pool: Pubkey) -> (V, RpcCli
 
 /// Construction & boundaries: the venue builds, loads state, exposes valid token
 /// info, computes boundaries with a positive spot price, and quotes with a
-/// positive price at both edges.
+/// positive price at both edges -- all without allocating in the quote path.
 pub async fn construction<V: SuiteVenue>(config: &SuiteConfig) {
     init_test_logger();
     let Some(rpc_url) = rpc_url_or_skip() else {
@@ -234,17 +170,15 @@ pub async fn construction<V: SuiteVenue>(config: &SuiteConfig) {
     );
 
     for (in_idx, out_idx) in venue.directions_num() {
-        let (lower, upper) = venue
-            .bounds(in_idx, out_idx)
-            .expect("boundary search failed");
+        let (lower, upper) =
+            assert_no_alloc(|| venue.bounds(in_idx, out_idx)).expect("boundary search failed");
         assert!(lower < upper, "lower bound must be < upper bound");
 
         let input_mint = venue.get_token(in_idx as usize).unwrap().pubkey;
         let output_mint = venue.get_token(out_idx as usize).unwrap().pubkey;
 
         for (edge, amount) in [("lower", lower), ("upper", upper)] {
-            let q = venue
-                .quote(exact_in(input_mint, output_mint, amount))
+            let q = assert_no_alloc(|| venue.quote(exact_in(input_mint, output_mint, amount)))
                 .unwrap_or_else(|_| panic!("{edge}-bound quote failed"));
             assert!(
                 !q.not_enough_liquidity,
@@ -387,10 +321,10 @@ pub async fn quoting_speed<V: SuiteVenue>(config: &SuiteConfig) {
     }
 }
 
-/// The reported marginal price is a finite, positive local probe. Integer atom
-/// rounding can make adjacent tiny probes non-monotone, so monotonicity is
-/// asserted on quoted output instead.
-pub async fn reported_price_positive<V: SuiteVenue>(config: &SuiteConfig) {
+/// Price monotonicity: the reported marginal price is positive and
+/// non-increasing as the input grows.
+pub async fn price_monotone<V: SuiteVenue>(config: &SuiteConfig) {
+    const REL_TOL: f64 = 1e-3; // slack so integer rounding can't look like a violation
     init_test_logger();
     let Some(rpc_url) = rpc_url_or_skip() else {
         return;
@@ -412,18 +346,71 @@ pub async fn reported_price_positive<V: SuiteVenue>(config: &SuiteConfig) {
             .collect();
         amounts.sort();
 
+        let mut prev_price = f64::INFINITY;
         for amount in amounts {
-            let request = exact_in(input_mint, output_mint, amount);
-            let quote = venue.quote(request.clone()).expect("quote failed");
-            assert_price_locally_consistent(&venue, request, quote.expected_output, quote.price);
+            let price = venue
+                .quote(exact_in(input_mint, output_mint, amount))
+                .expect("quote failed")
+                .price;
+            assert!(
+                price > 0.0,
+                "price must be positive, got {price} at {amount}"
+            );
+            assert!(
+                price <= prev_price * (1.0 + REL_TOL),
+                "price not monotone non-increasing: {prev_price} -> {price} at {amount}"
+            );
+            prev_price = price;
         }
     }
 }
 
-/// Local price probes should stay finite and positive around realized output
-/// changes. The exact chord can sit outside adjacent finite differences because
-/// CLMM quote output is floor-truncated to token atoms.
-pub async fn local_price_probe_consistent<V: SuiteVenue>(config: &SuiteConfig) {
+fn assert_price_brackets_chord<V: SuiteVenue>(
+    venue: &V,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    a: u64,
+    b: u64,
+) {
+    const REL_TOL: f64 = 1e-5; // 0.1 BPS
+    const OUT_QUANTUM: f64 = 2.0; // two output atoms of floor-truncation slack
+
+    if b <= a {
+        return;
+    }
+
+    let qa = venue
+        .quote(exact_in(input_mint, output_mint, a))
+        .expect("quote at a");
+    let qb = venue
+        .quote(exact_in(input_mint, output_mint, b))
+        .expect("quote at b");
+    if qb.expected_output <= qa.expected_output {
+        return; // flat step carries no rate information
+    }
+
+    let chord = (qb.expected_output - qa.expected_output) as f64 / (b - a) as f64;
+    let (price_a, price_b) = (qa.price, qb.price); // f'(a) >= f'(b)
+    let atol = OUT_QUANTUM / (b - a) as f64;
+
+    assert!(
+        price_b <= price_a * (1.0 + REL_TOL),
+        "price increased with size: f'({a})={price_a} < f'({b})={price_b}"
+    );
+    assert!(
+        chord <= price_a * (1.0 + REL_TOL) + atol,
+        "chord {chord} exceeds left price {price_a} (atol {atol}) on [{a}, {b}]"
+    );
+    assert!(
+        chord >= price_b * (1.0 - REL_TOL) - atol,
+        "chord {chord} below right price {price_b} (atol {atol}) on [{a}, {b}]"
+    );
+}
+
+/// Mean value theorem: the realized chord of the output curve is bracketed by
+/// the reported endpoint prices, certifying the price is the genuine derivative
+/// of the quoted output.
+pub async fn mean_value_theorem<V: SuiteVenue>(config: &SuiteConfig) {
     init_test_logger();
     let Some(rpc_url) = rpc_url_or_skip() else {
         return;
@@ -441,37 +428,34 @@ pub async fn local_price_probe_consistent<V: SuiteVenue>(config: &SuiteConfig) {
 
         let grid = geometric_grid(lb, ub, 64);
         for pair in grid.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            if b <= a {
-                continue;
-            }
-            let qa = venue
-                .quote(exact_in(input_mint, output_mint, a))
-                .expect("quote at a");
-            let qb = venue
-                .quote(exact_in(input_mint, output_mint, b))
-                .expect("quote at b");
-            if qb.expected_output <= qa.expected_output {
-                continue; // flat step carries no rate information
-            }
+            assert_price_brackets_chord(&venue, input_mint, output_mint, pair[0], pair[1]);
+        }
 
-            let chord = (qb.expected_output - qa.expected_output) as f64 / (b - a) as f64;
-            assert!(
-                chord.is_finite() && chord > 0.0,
-                "chord must be positive on [{a}, {b}], got {chord}"
-            );
-            assert_price_locally_consistent(
-                &venue,
-                exact_in(input_mint, output_mint, a),
-                qa.expected_output,
-                qa.price,
-            );
-            assert_price_locally_consistent(
-                &venue,
-                exact_in(input_mint, output_mint, b),
-                qb.expected_output,
-                qb.price,
-            );
+        for amount in geometric_grid(lb, ub, 32) {
+            let step = (amount / 97).max(1);
+            let left = amount.saturating_sub(step).max(lb);
+            let right = amount.saturating_add(step).min(ub);
+            assert_price_brackets_chord(&venue, input_mint, output_mint, left, amount);
+            assert_price_brackets_chord(&venue, input_mint, output_mint, amount, right);
+        }
+
+        let decimals = venue.get_token(in_idx as usize).unwrap().decimals;
+        if let Ok(decimals) = u32::try_from(decimals)
+            && let Some(unit) = 10u64.checked_pow(decimals)
+        {
+            for multiplier in [1u64, 10, 50, 100, 101, 200, 500, 1_000] {
+                let Some(center) = unit.checked_mul(multiplier) else {
+                    continue;
+                };
+                if center <= lb || center >= ub {
+                    continue;
+                }
+                let step = (unit / 10).max(1);
+                let left = center.saturating_sub(step).max(lb);
+                let right = center.saturating_add(step).min(ub);
+                assert_price_brackets_chord(&venue, input_mint, output_mint, left, center);
+                assert_price_brackets_chord(&venue, input_mint, output_mint, center, right);
+            }
         }
     }
 }

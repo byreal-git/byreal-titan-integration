@@ -7,15 +7,19 @@ use {
   anyhow::anyhow,
   byreal_clmm::{
     libraries::{
+      big_num::U1024,
       dynamic_fee_math::{
         calculate_dynamic_fee_rate, normalize_trade_size, price_from_sqrt_price_x64,
         quote_amount_from_base, DynamicFeeInputs,
       },
-      liquidity_math, swap_math, tick_math, MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64,
+      fixed_point_64, liquidity_math, swap_math,
+      tick_array_bit_map::{self, check_current_tick_array_is_initialized},
+      tick_math, MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64,
     },
+    states::config::FEE_RATE_DENOMINATOR_VALUE,
     states::{
       AmmConfig, PoolState, PoolStatusBitIndex, TickArrayBitmapExtension, TickArrayState,
-      TickState, TickUtils, TICK_ARRAY_SEED,
+      TickState, TickUtils, TICK_ARRAY_SEED, TICK_ARRAY_SIZE, TICK_ARRAY_SIZE_USIZE,
     },
     util::pyth::calculate_price_index,
   },
@@ -46,6 +50,7 @@ pub(super) struct CoreQuoteResult {
   pub in_amount: u64,
   pub out_amount: u64,
   pub not_enough_liquidity: bool,
+  pub price: f64,
 }
 
 pub(super) struct SwapBuildRequest {
@@ -59,12 +64,116 @@ pub(super) struct SwapBuildRequest {
 }
 
 #[derive(Clone)]
-pub enum DynamicTickArrayState {
+struct FixedTickArraySnapshot {
+  start_tick_index: i32,
+  ticks: [TickState; TICK_ARRAY_SIZE_USIZE],
+}
+
+impl FixedTickArraySnapshot {
+  fn from_account_data(data: &[u8]) -> Option<Self> {
+    const DISCRIMINATOR_LEN: usize = 8;
+    const POOL_ID_LEN: usize = 32;
+    const START_TICK_LEN: usize = 4;
+
+    let body = data.get(DISCRIMINATOR_LEN..)?;
+    let start_offset = POOL_ID_LEN;
+    let ticks_offset = start_offset + START_TICK_LEN;
+    let ticks_len = size_of::<TickState>() * TICK_ARRAY_SIZE_USIZE;
+    if body.len() < ticks_offset + ticks_len {
+      return None;
+    }
+
+    let start_tick_index =
+      bytemuck::pod_read_unaligned::<i32>(&body[start_offset..ticks_offset]);
+    let ticks_bytes = &body[ticks_offset..ticks_offset + ticks_len];
+    let ticks = std::array::from_fn(|i| {
+      let start = i * size_of::<TickState>();
+      let end = start + size_of::<TickState>();
+      bytemuck::pod_read_unaligned::<TickState>(&ticks_bytes[start..end])
+    });
+
+    Some(Self { start_tick_index, ticks })
+  }
+
+  fn tick_offset(&self, tick_index: i32, spacing: u16) -> Option<usize> {
+    let start_tick_index = TickUtils::get_array_start_index(tick_index, spacing);
+    if start_tick_index != self.start_tick_index {
+      return None;
+    }
+    TickUtils::get_tick_offset_in_tick_array(self.start_tick_index, tick_index, spacing).ok()
+  }
+
+  fn next_initialized_tick(
+    &self,
+    current_tick_index: i32,
+    tick_spacing: u16,
+    zero_for_one: bool,
+  ) -> Option<i32> {
+    if TickUtils::get_array_start_index(current_tick_index, tick_spacing) != self.start_tick_index {
+      return None;
+    }
+
+    let mut offset =
+      (current_tick_index - self.start_tick_index) / i32::from(tick_spacing);
+    if zero_for_one {
+      while offset >= 0 {
+        let tick = self.ticks[offset as usize];
+        if tick.is_initialized() {
+          return Some(tick.tick);
+        }
+        offset -= 1;
+      }
+    } else {
+      offset += 1;
+      while offset < TICK_ARRAY_SIZE {
+        let tick = self.ticks[offset as usize];
+        if tick.is_initialized() {
+          return Some(tick.tick);
+        }
+        offset += 1;
+      }
+    }
+    None
+  }
+
+  fn first_initialized_tick(&self, zero_for_one: bool) -> Option<i32> {
+    if zero_for_one {
+      for index in (0..TICK_ARRAY_SIZE_USIZE).rev() {
+        let tick = self.ticks[index];
+        if tick.is_initialized() {
+          return Some(tick.tick);
+        }
+      }
+    } else {
+      for index in 0..TICK_ARRAY_SIZE_USIZE {
+        let tick = self.ticks[index];
+        if tick.is_initialized() {
+          return Some(tick.tick);
+        }
+      }
+    }
+    None
+  }
+
+  fn get_tick_liquidity_net(&self, tick_index: i32, spacing: u16) -> Option<i128> {
+    self.tick_offset(tick_index, spacing).map(|offset| self.ticks[offset].liquidity_net)
+  }
+}
+
+#[derive(Clone)]
+enum DynamicTickArrayState {
   Dynamic(Box<(byreal_clmm::states::DynTickArrayState, Vec<TickState>)>),
-  Fixed(Box<TickArrayState>),
+  Fixed(Box<FixedTickArraySnapshot>),
 }
 
 impl DynamicTickArrayState {
+  fn start_tick_index(&self) -> i32 {
+    match self {
+      DynamicTickArrayState::Dynamic(inner) => inner.as_ref().0.start_tick_index,
+      DynamicTickArrayState::Fixed(ta) => ta.start_tick_index,
+    }
+  }
+
   fn decode_dyn_tick_array(
     data: &[u8],
   ) -> Option<(byreal_clmm::states::DynTickArrayState, Vec<TickState>)> {
@@ -98,11 +207,6 @@ impl DynamicTickArrayState {
     Some((header, ticks))
   }
 
-  fn decode_fixed_tick_array(data: &[u8]) -> Option<TickArrayState> {
-    let mut slice: &[u8] = data;
-    <TickArrayState as anchor_lang::AccountDeserialize>::try_deserialize(&mut slice).ok()
-  }
-
   pub fn from_account_data(data: &[u8]) -> Option<Self> {
     if data.len() < 8 {
       return None;
@@ -113,7 +217,7 @@ impl DynamicTickArrayState {
       Self::decode_dyn_tick_array(data)
         .map(|(header, ticks)| Self::Dynamic(Box::new((header, ticks))))
     } else if discriminator == TickArrayState::DISCRIMINATOR {
-      Self::decode_fixed_tick_array(data).map(|ta| Self::Fixed(Box::new(ta)))
+      FixedTickArraySnapshot::from_account_data(data).map(|ta| Self::Fixed(Box::new(ta)))
     } else {
       None
     }
@@ -136,10 +240,7 @@ impl DynamicTickArrayState {
           None
         }
       }
-      DynamicTickArrayState::Fixed(ta) => {
-        let mut ta = ta.clone();
-        ta.next_initialized_tick(cur_tick, spacing, zero_for_one).ok().flatten().map(|ts| ts.tick)
-      }
+      DynamicTickArrayState::Fixed(ta) => ta.next_initialized_tick(cur_tick, spacing, zero_for_one),
     }
   }
 
@@ -152,10 +253,7 @@ impl DynamicTickArrayState {
           .ok()
           .map(|local_idx| ticks[local_idx as usize].tick)
       }
-      DynamicTickArrayState::Fixed(ta) => {
-        let mut ta = ta.clone();
-        ta.first_initialized_tick(zero_for_one).ok().map(|ts| ts.tick)
-      }
+      DynamicTickArrayState::Fixed(ta) => ta.first_initialized_tick(zero_for_one),
     }
   }
 
@@ -168,10 +266,7 @@ impl DynamicTickArrayState {
           .ok()
           .map(|i| ticks[i as usize].liquidity_net)
       }
-      DynamicTickArrayState::Fixed(ta) => ta
-        .get_tick_offset_in_array(tick_index, spacing)
-        .ok()
-        .map(|offset| ta.ticks[offset].liquidity_net),
+      DynamicTickArrayState::Fixed(ta) => ta.get_tick_liquidity_net(tick_index, spacing),
     }
   }
 }
@@ -196,6 +291,8 @@ struct SwapState {
 struct SwapResult {
   amount_in: u64,
   amount_out: u64,
+  sqrt_price_x64: u128,
+  fee_rate: u32,
 }
 
 #[derive(Clone)]
@@ -361,9 +458,91 @@ impl ByrealClmmVenue {
     self.pool_state.is_swap_dynamic_fee_enabled()
   }
 
+  fn is_overflow_default_tickarray_bitmap(&self, tick_index: i32) -> bool {
+    let (min_start, max_start) = self.pool_state.tick_array_start_index_range();
+    let tick_array_start_index =
+      TickUtils::get_array_start_index(tick_index, self.pool_state.tick_spacing);
+    tick_array_start_index >= max_start || tick_array_start_index < min_start
+  }
+
+  fn first_initialized_tick_array(
+    &self,
+    zero_for_one: bool,
+  ) -> Result<(bool, i32), anyhow::Error> {
+    let current_start =
+      TickUtils::get_array_start_index(self.pool_state.tick_current, self.pool_state.tick_spacing);
+    let (is_initialized, start_index) =
+      if self.is_overflow_default_tickarray_bitmap(self.pool_state.tick_current) {
+        let bitmap_extension = self
+          .bitmap_extension
+          .as_ref()
+          .ok_or_else(|| anyhow!("Missing tick array bitmap extension account"))?;
+        bitmap_extension.check_tick_array_is_initialized(
+          current_start,
+          self.pool_state.tick_spacing,
+        )?
+      } else {
+        check_current_tick_array_is_initialized(
+          U1024(self.pool_state.tick_array_bitmap),
+          self.pool_state.tick_current,
+          self.pool_state.tick_spacing,
+        )?
+      };
+
+    if is_initialized {
+      return Ok((true, start_index));
+    }
+
+    let next_start = self.next_initialized_tick_array_start_index(current_start, zero_for_one)?;
+    next_start
+      .map(|start| (false, start))
+      .ok_or_else(|| anyhow!("Liquidity insufficient: no initialized tick array for direction"))
+  }
+
+  fn next_initialized_tick_array_start_index(
+    &self,
+    mut last_tick_array_start_index: i32,
+    zero_for_one: bool,
+  ) -> Result<Option<i32>, anyhow::Error> {
+    last_tick_array_start_index =
+      TickUtils::get_array_start_index(last_tick_array_start_index, self.pool_state.tick_spacing);
+
+    loop {
+      let (is_found, start_index) = tick_array_bit_map::next_initialized_tick_array_start_index(
+        U1024(self.pool_state.tick_array_bitmap),
+        last_tick_array_start_index,
+        self.pool_state.tick_spacing,
+        zero_for_one,
+      );
+      if is_found {
+        return Ok(Some(start_index));
+      }
+      last_tick_array_start_index = start_index;
+
+      let Some(bitmap_extension) = self.bitmap_extension.as_ref() else {
+        return Err(anyhow!("Missing tick array bitmap extension account"));
+      };
+
+      let (is_found, start_index) = bitmap_extension.next_initialized_tick_array_from_one_bitmap(
+        last_tick_array_start_index,
+        self.pool_state.tick_spacing,
+        zero_for_one,
+      )?;
+      if is_found {
+        return Ok(Some(start_index));
+      }
+      last_tick_array_start_index = start_index;
+
+      if last_tick_array_start_index < tick_math::MIN_TICK
+        || last_tick_array_start_index > tick_math::MAX_TICK
+      {
+        return Ok(None);
+      }
+    }
+  }
+
   fn init_tick_nav_state(&self, zero_for_one: bool) -> Result<TickNavState, anyhow::Error> {
-    let (is_match, first_start) =
-      self.pool_state.get_first_initialized_tick_array(&self.bitmap_extension, zero_for_one)?;
+    let (is_match, first_start) = self.first_initialized_tick_array(zero_for_one)?;
     Ok(TickNavState {
       is_match_pool_current_tick_array: is_match,
       current_valid_tick_array_start_index: first_start,
@@ -490,6 +669,13 @@ impl ByrealClmmVenue {
     Ok(live)
   }
 
+  fn loaded_tick_array_by_start_index(&self, start_index: i32) -> Option<&DynamicTickArrayState> {
+    self
+      .dynamic_tick_arrays
+      .values()
+      .find(|tick_array| tick_array.start_tick_index() == start_index)
+  }
+
   fn find_next_initialized_tick_with_nav(
     &self,
     current_tick: i32,
@@ -500,10 +686,8 @@ impl ByrealClmmVenue {
 
     loop {
       let start_index = nav.current_valid_tick_array_start_index;
-      let addr = self.get_tick_array_address(start_index);
       let tick_array = self
-        .dynamic_tick_arrays
-        .get(&addr)
+        .loaded_tick_array_by_start_index(start_index)
         .ok_or_else(|| anyhow!("Missing tick array data for start_index {}", start_index))?;
 
       if let Some(t) = tick_array.next_initialized_tick(current_tick, spacing, zero_for_one) {
@@ -517,8 +701,7 @@ impl ByrealClmmVenue {
         }
       }
 
-      let next_arr = self.pool_state.next_initialized_tick_array_start_index(
-        &self.bitmap_extension,
+      let next_arr = self.next_initialized_tick_array_start_index(
         nav.current_valid_tick_array_start_index,
         zero_for_one,
       )?;
@@ -527,8 +710,7 @@ impl ByrealClmmVenue {
       };
       nav.current_valid_tick_array_start_index = next_start;
 
-      let next_addr = self.get_tick_array_address(next_start);
-      let next_tick_array = self.dynamic_tick_arrays.get(&next_addr).ok_or_else(|| {
+      let next_tick_array = self.loaded_tick_array_by_start_index(next_start).ok_or_else(|| {
         anyhow!("Missing tick array data for advanced start_index {}", next_start)
       })?;
       if let Some(t) = next_tick_array.first_initialized_tick(zero_for_one) {
@@ -540,8 +722,9 @@ impl ByrealClmmVenue {
   fn get_tick_liquidity_net(&self, tick_index: i32) -> Option<i128> {
     let spacing = self.pool_state.tick_spacing;
     let start = TickUtils::get_array_start_index(tick_index, spacing);
-    let addr = self.get_tick_array_address(start);
-    self.dynamic_tick_arrays.get(&addr)?.get_tick_liquidity_net(tick_index, spacing)
+    self
+      .loaded_tick_array_by_start_index(start)?
+      .get_tick_liquidity_net(tick_index, spacing)
   }
 
   fn load_dynamic_pyth_prices(&self) -> Result<(Price, Price), anyhow::Error> {
@@ -668,7 +851,7 @@ impl ByrealClmmVenue {
       }
     });
 
-    let (state, _) = self.run_swap(
+    let (state, fee_rate) = self.run_swap(
       zero_for_one,
       amount_specified,
       sqrt_price_limit,
@@ -678,11 +861,103 @@ impl ByrealClmmVenue {
     let amount_in = amount_specified
       .checked_sub(state.amount_specified_remaining)
       .ok_or_else(|| anyhow!("compute_swap: raw input underflow"))?;
-    if amount_in == 0 || state.amount_calculated == 0 {
-      return Err(anyhow!("swap produced zero amount; chain would reject TooSmallInputOrOutputAmount"));
+    Ok(SwapResult {
+      amount_in,
+      amount_out: state.amount_calculated,
+      sqrt_price_x64: state.sqrt_price_x64,
+      fee_rate,
+    })
+  }
+
+  fn marginal_price_from_swap_state(
+    &self,
+    zero_for_one: bool,
+    sqrt_price_x64: u128,
+    fee_rate: u32,
+  ) -> Result<f64, anyhow::Error> {
+    let price_x64 = price_from_sqrt_price_x64(sqrt_price_x64).map_err(|e| anyhow!(e))?;
+    let pool_price = price_x64 as f64 / fixed_point_64::Q64 as f64;
+    let fee_multiplier =
+      (FEE_RATE_DENOMINATOR_VALUE - fee_rate) as f64 / FEE_RATE_DENOMINATOR_VALUE as f64;
+    if zero_for_one {
+      Ok(pool_price * fee_multiplier)
+    } else {
+      Ok(fee_multiplier / pool_price)
+    }
+  }
+
+  fn input_token_unit(&self, zero_for_one: bool) -> Option<u64> {
+    let decimals = if zero_for_one {
+      self.pool_state.mint_decimals_0
+    } else {
+      self.pool_state.mint_decimals_1
+    };
+    10u64.checked_pow(u32::from(decimals))
+  }
+
+  fn dynamic_fee_price_step(&self, zero_for_one: bool, amount: u64) -> Option<u64> {
+    let input_unit = self.input_token_unit(zero_for_one)?;
+    if amount < input_unit / 10 {
+      return None;
     }
 
-    Ok(SwapResult { amount_in, amount_out: state.amount_calculated })
+    let step = (amount / 1_000).max(input_unit / 10).min(amount);
+    (step > 0).then_some(step)
+  }
+
+  fn actual_curve_price(
+    &self,
+    zero_for_one: bool,
+    amount: u64,
+    swap: &SwapResult,
+    constant_fee_price: f64,
+    current_timestamp: i64,
+    upper_bound: Option<u64>,
+  ) -> Result<f64, anyhow::Error> {
+    if !self.is_swap_dynamic_fee_enabled() {
+      return Ok(constant_fee_price);
+    }
+
+    let Some(step) = self.dynamic_fee_price_step(zero_for_one, amount) else {
+      return Ok(constant_fee_price);
+    };
+
+    let mut upper_price = constant_fee_price;
+    let previous_amount = amount - step;
+    let previous_swap = self.compute_swap(zero_for_one, previous_amount, None, current_timestamp)?;
+    if swap.amount_out <= previous_swap.amount_out {
+      return Ok(constant_fee_price);
+    }
+
+    let realized_price = (swap.amount_out - previous_swap.amount_out) as f64 / step as f64;
+    if realized_price.is_finite() && realized_price > 0.0 {
+      upper_price = upper_price.min(realized_price);
+    }
+
+    let Some(upper_bound) = upper_bound else {
+      return Ok(upper_price);
+    };
+    if amount >= upper_bound {
+      return Ok(upper_price);
+    }
+
+    let next_step = step.min(upper_bound - amount);
+    let next_amount = amount + next_step;
+    let next_swap = self.compute_swap(zero_for_one, next_amount, None, current_timestamp)?;
+    if next_swap.amount_out <= swap.amount_out {
+      return Ok(upper_price);
+    }
+
+    let lower_price = (next_swap.amount_out - swap.amount_out) as f64 / next_step as f64;
+    if !lower_price.is_finite() || lower_price <= 0.0 {
+      return Ok(upper_price);
+    }
+
+    if lower_price <= upper_price {
+      Ok(constant_fee_price.clamp(lower_price, upper_price))
+    } else {
+      Ok(constant_fee_price.max(lower_price))
+    }
   }
 
   /// Resolve the trade fee rate and run the exact-in swap-step loop.
@@ -1000,14 +1275,14 @@ impl ByrealClmmVenue {
   }
 
   pub fn quote(&self, request: QuoteRequest) -> Result<CoreQuoteResult, TradingVenueError> {
-    if request.amount == 0 {
-      return Ok(CoreQuoteResult {
-        in_amount: 0,
-        out_amount: 0,
-        not_enough_liquidity: false,
-      });
-    }
+    self.quote_with_price_upper_bound(request, None)
+  }
 
+  pub fn quote_with_price_upper_bound(
+    &self,
+    request: QuoteRequest,
+    upper_bound: Option<u64>,
+  ) -> Result<CoreQuoteResult, TradingVenueError> {
     let (input_is_0, _output_is_0) =
       self.validate_mints(request.input_mint, request.output_mint)?;
     let zero_for_one = input_is_0;
@@ -1044,6 +1319,25 @@ impl ByrealClmmVenue {
       ));
     }
 
+    if request.amount == 0 {
+      let fee_rate = self
+        .compute_trade_fee_rate(zero_for_one, 0, self.current_unix_timestamp)
+        .map_err(|e| TradingVenueError::MathError(ErrorInfo::String(format!(
+          "spot price fee calculation failed: {e}"
+        ))))?;
+      let price = self
+        .marginal_price_from_swap_state(zero_for_one, self.pool_state.sqrt_price_x64, fee_rate)
+        .map_err(|e| TradingVenueError::MathError(ErrorInfo::String(format!(
+          "spot price calculation failed: {e}"
+        ))))?;
+      return Ok(CoreQuoteResult {
+        in_amount: 0,
+        out_amount: 0,
+        not_enough_liquidity: false,
+        price,
+      });
+    }
+
     let swap = match self.compute_swap(
       zero_for_one,
       request.amount,
@@ -1058,6 +1352,7 @@ impl ByrealClmmVenue {
             in_amount: 0,
             out_amount: 0,
             not_enough_liquidity: true,
+            price: 0.0,
           });
         }
         return Err(if msg.contains("dynamic fee") || msg.contains("pyth") || msg.contains("vault") {
@@ -1068,10 +1363,29 @@ impl ByrealClmmVenue {
       }
     };
 
+    let constant_fee_price = self
+      .marginal_price_from_swap_state(zero_for_one, swap.sqrt_price_x64, swap.fee_rate)
+      .map_err(|e| TradingVenueError::MathError(ErrorInfo::String(format!(
+        "marginal price calculation failed: {e}"
+      ))))?;
+    let price = self
+      .actual_curve_price(
+        zero_for_one,
+        request.amount,
+        &swap,
+        constant_fee_price,
+        self.current_unix_timestamp,
+        upper_bound,
+      )
+      .map_err(|e| TradingVenueError::MathError(ErrorInfo::String(format!(
+        "actual curve price calculation failed: {e}"
+      ))))?;
+
     Ok(CoreQuoteResult {
       in_amount: swap.amount_in,
       out_amount: swap.amount_out,
-      not_enough_liquidity: false,
+      not_enough_liquidity: swap.amount_in < request.amount,
+      price,
     })
   }
 
